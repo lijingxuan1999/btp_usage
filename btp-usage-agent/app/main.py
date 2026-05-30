@@ -1,7 +1,10 @@
-# CRITICAL: load .env BEFORE importing AI frameworks so credentials are in os.environ
+# Load .env BEFORE importing AI frameworks so credentials are in os.environ.
+# load_dotenv() is a no-op when no .env file exists — environment variables
+# injected by the container runtime (BTP bindings, K8s Secrets, docker run -e)
+# are already present in os.environ and take priority over any .env file.
 import os
 from dotenv import load_dotenv
-load_dotenv()  # reads /app/.env → populates AICORE_* env vars
+load_dotenv(override=False)  # override=False: runtime env vars always win over .env file
 
 import logging
 

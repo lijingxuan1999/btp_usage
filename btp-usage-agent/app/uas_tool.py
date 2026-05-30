@@ -24,7 +24,7 @@ import httpx
 from dotenv import load_dotenv
 from langchain_core.tools import tool
 
-load_dotenv()
+load_dotenv(override=False)  # no-op in container; runtime env vars take priority
 logger = logging.getLogger(__name__)
 
 # ─── OAuth2 token cache ────────────────────────────────────────────────────────
