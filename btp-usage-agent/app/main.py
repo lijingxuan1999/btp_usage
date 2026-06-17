@@ -2,6 +2,7 @@
 # load_dotenv() is a no-op when no .env file exists — environment variables
 # injected by the container runtime (BTP bindings, K8s Secrets, docker run -e)
 # are already present in os.environ and take priority over any .env file.
+import atexit
 import os
 from dotenv import load_dotenv
 load_dotenv(override=False)  # override=False: runtime env vars always win over .env file
@@ -80,6 +81,16 @@ def main(host: str, port: int):
     # Pre-fetch SAP orchestration deployment URL and cache it at class level
     # (fixes JSONDecodeError: new instance created per call, @cached_property never re-used)
     _patch_sap_deployment_url()
+
+    # Start APScheduler in background thread for daily reports and anomaly alerts
+    try:
+        from scheduler import build_scheduler
+        scheduler = build_scheduler()
+        scheduler.start()
+        atexit.register(lambda: scheduler.shutdown(wait=False))
+        logger.info("APScheduler started — daily report and anomaly check jobs active")
+    except Exception as exc:
+        logger.warning("APScheduler failed to start (non-fatal): %s", exc)
 
     skill = AgentSkill(
         id="btp-usage-agent",

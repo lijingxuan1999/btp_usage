@@ -19,6 +19,10 @@ httpx==0.28.1
 python-dotenv==1.2.2
 click==8.1.8
 
+# ── Scheduling & Notifications ───────────────────────────────────────────────
+apscheduler==3.10.4
+matplotlib==3.9.0
+
 # ── MCP protocol ────────────────────────────────────────────────────────────
 mcp==1.27.2
 

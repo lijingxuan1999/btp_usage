@@ -37,6 +37,10 @@ from hana_tool import (
     get_hana_metric_definitions,
     get_hana_metrics,
 )
+from email_tool import (
+    # ── On-demand summary email ───────────────────────────────────────────────
+    send_summary_email,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,13 +68,18 @@ _HANA_TOOLS = [
     get_hana_metrics,
 ]
 
+_EMAIL_TOOLS = [
+    # ── On-demand report email (user-triggered via chat) ──────────────────────
+    send_summary_email,
+]
+
 
 async def get_mcp_tools(use_cache: bool = True) -> list:
-    """Return all tools (UAS + HANA) for the agent.
+    """Return all tools (UAS + HANA + Email) for the agent.
 
     Signature is kept compatible with the standard mcp_tools contract
     so agent_executor.py requires no changes.
     """
-    all_tools = _UAS_TOOLS + _HANA_TOOLS
+    all_tools = _UAS_TOOLS + _HANA_TOOLS + _EMAIL_TOOLS
     logger.info("Loaded %d tool(s): %s", len(all_tools), [t.name for t in all_tools])
     return all_tools
