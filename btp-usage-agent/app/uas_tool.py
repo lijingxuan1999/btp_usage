@@ -1777,3 +1777,237 @@ async def get_global_account_monthly_usage(
         "grouped_data":        grouped_data,
         "raw_summary":         raw_summary,
     }, ensure_ascii=False)
+
+
+@tool
+async def check_quota_status(
+    contract_cu: float,
+    contract_start: str,
+    contract_end: str,
+    reference_date: Optional[str] = None,
+) -> str:
+    """
+    Check whether AI Core CU consumption is on track against an annual contract quota.
+
+    Answers the core business question:
+      "Will we exceed our contracted CU limit by year end?"
+
+    Uses three checks:
+      1. This month  — used so far vs monthly target (contract_cu / 12)
+      2. Cumulative  — total used since contract start vs proportional budget
+      3. Year-end    — projected annual spend vs contract limit
+
+    Args:
+        contract_cu:    Total CU purchased in the contract (e.g. 100000)
+        contract_start: Contract start date in YYYY-MM-DD format (e.g. "2026-01-01")
+        contract_end:   Contract end date in YYYY-MM-DD format (e.g. "2026-12-31")
+        reference_date: Treat this as today (YYYY-MM-DD). Defaults to today UTC.
+
+    Returns:
+        JSON with:
+          contract          — contract_cu, contract_start, contract_end, monthly_target
+          this_month        — used, target, pct_used, days_elapsed, days_remaining, status
+          cumulative        — allowed, used, delta, pct_used, months_elapsed, status
+          projection        — avg_monthly_spend, projected_annual, buffer, will_exceed,
+                              estimated_breach_date (if at risk), status
+          verdict           — SAFE / AT_RISK / WILL_EXCEED
+          summary_text      — human-readable one-paragraph summary
+    """
+    from calendar import monthrange
+
+    # ── 1. Resolve reference date ────────────────────────────────────────────
+    today_utc = datetime.now(tz=timezone.utc).date()
+    if reference_date:
+        try:
+            ref = datetime.strptime(reference_date, "%Y-%m-%d").date()
+            if ref > today_utc:
+                ref = today_utc
+        except ValueError:
+            ref = today_utc
+    else:
+        ref = today_utc
+
+    # ── 2. Parse contract dates ──────────────────────────────────────────────
+    try:
+        c_start = datetime.strptime(contract_start, "%Y-%m-%d").date()
+        c_end   = datetime.strptime(contract_end,   "%Y-%m-%d").date()
+    except ValueError as exc:
+        return json.dumps({"error": f"Invalid contract date format: {exc}"})
+
+    if c_start >= c_end:
+        return json.dumps({"error": "contract_start must be before contract_end"})
+
+    # Clamp reference date to contract window
+    ref = max(c_start, min(ref, c_end))
+
+    # ── 3. Contract constants ────────────────────────────────────────────────
+    contract_days   = (c_end - c_start).days + 1
+    monthly_target  = round(contract_cu / 12, 2)
+
+    # ── 4. Fetch AI Core CU since contract start ─────────────────────────────
+    fetch_from = contract_start
+    fetch_to   = ref.strftime("%Y-%m-%d")
+
+    try:
+        records = await _fetch_usage(fetch_from, fetch_to)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+    cu_records = [
+        r for r in records
+        if r.get("serviceId", "").lower() == "ai-core"
+        and r.get("measureId", "").lower() == "capacity_units"
+    ]
+
+    # ── 5. Aggregate: total used + per-month + current month ─────────────────
+    month_totals: dict[str, float] = {}
+    for r in cu_records:
+        d  = r.get("startIsoDate", "")
+        cu = float(r.get("usage", 0))
+        if d:
+            ym = d[:7]  # YYYY-MM
+            month_totals[ym] = round(month_totals.get(ym, 0.0) + cu, 6)
+
+    total_used = round(sum(month_totals.values()), 6)
+
+    # Current month stats
+    current_ym          = ref.strftime("%Y-%m")
+    current_month_used  = round(month_totals.get(current_ym, 0.0), 6)
+    days_in_month       = monthrange(ref.year, ref.month)[1]
+    month_start         = ref.replace(day=1)
+    days_elapsed_month  = (ref - month_start).days + 1
+    days_remaining_month = days_in_month - days_elapsed_month
+    month_pct           = round(current_month_used / monthly_target * 100, 1) if monthly_target > 0 else 0.0
+
+    # ── 6. Cumulative budget check ───────────────────────────────────────────
+    # How many months (including partial) have elapsed since contract start
+    months_elapsed = (
+        (ref.year - c_start.year) * 12 + (ref.month - c_start.month)
+        + (days_elapsed_month / days_in_month)
+    )
+    months_elapsed = round(months_elapsed, 2)
+
+    cumulative_allowed = round(monthly_target * months_elapsed, 2)
+    cumulative_delta   = round(total_used - cumulative_allowed, 2)  # positive = overspent
+    cumulative_pct     = round(total_used / cumulative_allowed * 100, 1) if cumulative_allowed > 0 else 0.0
+
+    if cumulative_delta > monthly_target * 0.5:
+        cumulative_status = "BEHIND"   # overspent by more than half a month's budget
+    elif cumulative_delta < -monthly_target * 0.5:
+        cumulative_status = "AHEAD"    # underspent by more than half a month's budget
+    else:
+        cumulative_status = "ON_TRACK"
+
+    # ── 7. Year-end projection ───────────────────────────────────────────────
+    days_elapsed_contract  = (ref - c_start).days + 1
+    days_remaining_contract = (c_end - ref).days
+
+    if days_elapsed_contract > 0:
+        daily_burn_rate    = total_used / days_elapsed_contract
+        projected_annual   = round(daily_burn_rate * contract_days, 2)
+        avg_monthly_spend  = round(total_used / months_elapsed, 2) if months_elapsed > 0 else 0.0
+        buffer             = round(contract_cu - projected_annual, 2)
+    else:
+        daily_burn_rate   = 0.0
+        projected_annual  = 0.0
+        avg_monthly_spend = 0.0
+        buffer            = contract_cu
+
+    # Estimated breach date (if projected to exceed)
+    estimated_breach_date = None
+    if daily_burn_rate > 0:
+        cu_remaining = contract_cu - total_used
+        if cu_remaining > 0:
+            days_to_breach = cu_remaining / daily_burn_rate
+            breach = ref + timedelta(days=days_to_breach)
+            if breach <= c_end:
+                estimated_breach_date = breach.strftime("%Y-%m-%d")
+        else:
+            estimated_breach_date = ref.strftime("%Y-%m-%d")  # already exceeded
+
+    # ── 8. Verdict ───────────────────────────────────────────────────────────
+    if projected_annual > contract_cu:
+        verdict = "WILL_EXCEED"
+    elif projected_annual > contract_cu * 0.90:
+        verdict = "AT_RISK"     # within 10% of limit
+    else:
+        verdict = "SAFE"
+
+    # Month-level status
+    if month_pct > 100:
+        month_status = "OVER"
+    elif month_pct > 85:
+        month_status = "AT_RISK"
+    else:
+        month_status = "ON_TRACK"
+
+    # Projection status
+    if verdict == "WILL_EXCEED":
+        projection_status = "WILL_EXCEED"
+    elif verdict == "AT_RISK":
+        projection_status = "AT_RISK"
+    else:
+        projection_status = "SAFE"
+
+    # ── 9. Human-readable summary ─────────────────────────────────────────────
+    verdict_emoji = {"SAFE": "✓", "AT_RISK": "⚠️", "WILL_EXCEED": "⚠️"}[verdict]
+    summary_lines = [
+        f"{verdict_emoji} {verdict} — Annual contract: {contract_cu:,.0f} CU",
+        f"",
+        f"This month ({current_ym}):",
+        f"  Used: {current_month_used:,.1f} CU of {monthly_target:,.1f} CU target "
+        f"({month_pct}%) — {days_remaining_month} days remaining — {month_status}",
+        f"",
+        f"Cumulative ({contract_start} → {fetch_to}):",
+        f"  Budget allowed: {cumulative_allowed:,.1f} CU ({months_elapsed:.1f} months × {monthly_target:,.1f})",
+        f"  Actually used:  {total_used:,.1f} CU",
+        f"  {'Overspent' if cumulative_delta > 0 else 'Surplus'}: {abs(cumulative_delta):,.1f} CU — {cumulative_status}",
+        f"",
+        f"Year-end projection:",
+        f"  Avg monthly spend: {avg_monthly_spend:,.1f} CU",
+        f"  Projected annual:  {projected_annual:,.1f} CU",
+        f"  vs Contract:       {contract_cu:,.0f} CU",
+        f"  Buffer remaining:  {buffer:,.1f} CU" if buffer >= 0 else f"  Exceeds by:        {abs(buffer):,.1f} CU",
+        f"  Status: {projection_status}",
+    ]
+    if estimated_breach_date:
+        summary_lines.append(f"  Estimated breach date: {estimated_breach_date}")
+
+    summary_text = "\n".join(summary_lines)
+
+    return json.dumps({
+        "contract": {
+            "contract_cu":     contract_cu,
+            "contract_start":  contract_start,
+            "contract_end":    contract_end,
+            "monthly_target":  monthly_target,
+        },
+        "this_month": {
+            "month":              current_ym,
+            "used":               current_month_used,
+            "target":             monthly_target,
+            "pct_used":           month_pct,
+            "days_elapsed":       days_elapsed_month,
+            "days_remaining":     days_remaining_month,
+            "status":             month_status,
+        },
+        "cumulative": {
+            "months_elapsed":   months_elapsed,
+            "allowed":          cumulative_allowed,
+            "used":             total_used,
+            "delta":            cumulative_delta,
+            "pct_used":         cumulative_pct,
+            "status":           cumulative_status,
+        },
+        "projection": {
+            "avg_monthly_spend":      avg_monthly_spend,
+            "daily_burn_rate":        round(daily_burn_rate, 4),
+            "projected_annual":       projected_annual,
+            "buffer":                 buffer,
+            "will_exceed":            projected_annual > contract_cu,
+            "estimated_breach_date":  estimated_breach_date,
+            "status":                 projection_status,
+        },
+        "verdict":      verdict,
+        "summary_text": summary_text,
+    }, ensure_ascii=False)

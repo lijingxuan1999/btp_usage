@@ -25,6 +25,8 @@ from uas_tool import (
     get_aicore_model_cu_usage,
     simulate_aicore_cu_eom_forecast,
     detect_aicore_cu_anomaly,
+    # ── Contract quota tracking ───────────────────────────────────────────────
+    check_quota_status,
 )
 from hana_tool import (
     # ── HANA Cloud instance discovery ────────────────────────────────────────
@@ -40,8 +42,6 @@ logger = logging.getLogger(__name__)
 
 _UAS_TOOLS = [
     # ── Global account discovery & monthly reporting ──────────────────────────
-    # Call list_subaccounts first to discover available subaccount IDs,
-    # then pass a subaccount ID to get_btp_usage for daily detail.
     list_subaccounts,
     get_global_account_monthly_usage,
     # ── Subaccount daily usage (UAS /reports/v1/subaccountUsage) ─────────────
@@ -50,6 +50,8 @@ _UAS_TOOLS = [
     get_aicore_model_cu_usage,
     simulate_aicore_cu_eom_forecast,
     detect_aicore_cu_anomaly,
+    # ── Contract quota tracking ───────────────────────────────────────────────
+    check_quota_status,
 ]
 
 _HANA_TOOLS = [
