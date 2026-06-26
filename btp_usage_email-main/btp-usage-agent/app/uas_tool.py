@@ -618,8 +618,8 @@ async def get_aicore_model_cu_usage(
                 period_totals[period] = round(period_totals.get(period, 0.0) + cu, 6)
 
         result["by_period"] = sorted(
-            [{"date": p, "period": p, "total_cu": cu} for p, cu in period_totals.items()],
-            key=lambda x: x["date"],
+            [{"period": p, "total_cu": cu} for p, cu in period_totals.items()],
+            key=lambda x: x["period"],
         )
 
     return json.dumps(result, ensure_ascii=False)

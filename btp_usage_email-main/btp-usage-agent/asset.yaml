@@ -1,0 +1,31 @@
+apiVersion: asset.sap/v1
+kind: Asset
+
+metadata:
+  name: btp-usage-agent
+  version: "1.0.0"
+
+type: agent
+
+container:
+  buildPath: .
+  port: 5000
+
+probes:
+  startup:
+    path: /.well-known/agent-card.json
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 24
+  liveness:
+    path: /.well-known/agent-card.json
+    initialDelaySeconds: 15
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readiness:
+    path: /.well-known/agent-card.json
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3

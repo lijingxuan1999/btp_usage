@@ -21,14 +21,13 @@ click==8.1.8
 
 # ── Scheduling & Notifications ───────────────────────────────────────────────
 apscheduler==3.10.4
+matplotlib==3.9.0
 
 # ── MCP protocol ────────────────────────────────────────────────────────────
 mcp==1.27.2
 
 # ── OpenTelemetry ───────────────────────────────────────────────────────────
 opentelemetry-instrumentation-starlette==0.62b1
-
-# Cache-bust: 2026-06-24-v11
 
 # NOTE: sap-cloud-sdk removed — the three decorators it provides
 # (agent_model, agent_config, prompt_section) are stubbed locally in

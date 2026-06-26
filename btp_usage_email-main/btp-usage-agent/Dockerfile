@@ -10,19 +10,15 @@ ENV HOST=0.0.0.0
 # Platform OTLP collector only supports /v1/traces, not /v1/metrics — disable metrics exporter
 ENV OTEL_METRICS_EXPORTER=none
 
-# Charts are rendered as pure-Python inline SVG — no native image libraries needed.
-# No apt-get install required.
-
-# Install Python dependencies
+# Install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY app/ ./app/
 
-# Copy .env into the image so credentials are available at runtime
+# Copy .env and .env.example into the image so credentials are available at runtime
 COPY .env.example ./
-COPY .env .env
 
 # Run the agent
 CMD ["python", "app/main.py", "--host", "0.0.0.0", "--port", "5000"]

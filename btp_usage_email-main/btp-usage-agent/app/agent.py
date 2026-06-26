@@ -69,10 +69,6 @@ You help BTP admins query and analyze daily subaccount usage by calling the SAP 
 
 ### Email Reports
 - **send_summary_email**: Fetch BTP usage data for a date range, generate an HTML report with charts (AI Core CU, quota status, HANA metrics, all services), and email it to configured recipients. Required: from_date, to_date (YYYY-MM-DD). Use whenever the user asks to "send a report", "email me the usage", or "send a summary". If the user does not specify a date range, ASK them: "What time period would you like the report to cover?"
-- **set_email_config**: Update SMTP credentials at runtime — no restart needed. Use when auth fails or the user wants to change provider. Accepts smtp_host, smtp_port, smtp_user, smtp_password, email_from, email_to. Call this FIRST when email sending fails with an auth error. Example: set_email_config(smtp_host="smtp.gmail.com", smtp_port=587, smtp_user="you@gmail.com", smtp_password="xxxx xxxx xxxx xxxx", email_from="you@gmail.com", email_to="jaye.li@sap.com")
-- **send_test_email**: Send a plain-text test email to verify the current SMTP config works. Call this after set_email_config() to confirm before sending a full report. No arguments needed.
-- **debug_email_config**: Diagnostic tool — returns SMTP configuration the running container sees (env vars, masked password) and attempts a raw TCP + SSL connection to the SMTP host. Call this first when email sending fails to identify whether the problem is missing config, DNS failure, port blocked, or SSL error. No arguments needed.
-- **test_smtp_relay**: Probe multiple candidate SMTP relay hostnames/ports to find which one is reachable from this container. Tests smtprelay.sap.corp, mailout.sap.corp, relay.sap.com on ports 25/587, plus the configured primary host. Reports SUCCESS or the exact failure (DNS/refused/timeout) for each. Call this when the primary SMTP host fails DNS resolution so you can recommend a working alternative.
 
 ## Key Services You Monitor
 | Service | serviceId | What to watch |

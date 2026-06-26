@@ -81,22 +81,14 @@ def _anomaly_check_job() -> None:
 
 
 def build_scheduler() -> BackgroundScheduler:
-    """Build and configure the APScheduler BackgroundScheduler.
-
-    Daily report time is controlled by two env vars (UTC):
-      SCHEDULER_REPORT_HOUR   — hour   (0-23, default 2)
-      SCHEDULER_REPORT_MINUTE — minute (0-59, default 25)
-
-    Default is 02:25 UTC = 10:25 UTC+8 (Beijing time).
-    """
-    report_hour   = int(os.environ.get("SCHEDULER_REPORT_HOUR",   "2"))
-    report_minute = int(os.environ.get("SCHEDULER_REPORT_MINUTE", "25"))
+    """Build and configure the APScheduler BackgroundScheduler."""
+    report_hour = int(os.environ.get("SCHEDULER_REPORT_HOUR", "6"))
 
     scheduler = BackgroundScheduler(timezone="UTC")
 
     scheduler.add_job(
         _daily_report_job,
-        trigger=CronTrigger(hour=report_hour, minute=report_minute, timezone="UTC"),
+        trigger=CronTrigger(hour=report_hour, minute=0, timezone="UTC"),
         id="daily_report",
         name="Daily BTP Usage Report Email",
         replace_existing=True,
@@ -113,8 +105,7 @@ def build_scheduler() -> BackgroundScheduler:
     )
 
     logger.info(
-        "Scheduler configured: daily report at %02d:%02d UTC (= %02d:%02d UTC+8), anomaly check every 4h",
-        report_hour, report_minute,
-        (report_hour + 8) % 24, report_minute,
+        "Scheduler configured: daily report at %02d:00 UTC, anomaly check every 4h",
+        report_hour,
     )
     return scheduler

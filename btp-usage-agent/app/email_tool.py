@@ -1,277 +1,394 @@
 """
-BTP Usage Agent — Email Notification Module
+BTP Usage Agent — Email Notification Module — v3 (pure-Python SVG charts)
 
-Provides three email capabilities:
-  1. send_summary_email(from_date, to_date)  — on-demand, LLM-callable @tool
-  2. send_daily_report_email()               — called by scheduler every morning
-  3. send_anomaly_alert_email(anomaly_result) — called by scheduler on spike detection
-
-HTML reports include matplotlib charts embedded as inline CID PNG attachments.
+Charts are rendered as inline SVG strings embedded directly in the HTML body.
+No matplotlib, no Pillow, no native extensions required.
 
 Required environment variables (.env):
-  SMTP_HOST      = smtp.gmail.com
+  SMTP_HOST      = auth.mail.net.sap
   SMTP_PORT      = 587
-  SMTP_USER      = your@email.com
-  SMTP_PASSWORD  = your-app-password
-  EMAIL_FROM     = btp-agent@yourcompany.com
-  EMAIL_TO       = admin@yourcompany.com   (comma-separated for multiple)
+  SMTP_USER      = hackathon-alerts
+  SMTP_PASSWORD  = QAZwsx123!@#
+  EMAIL_FROM     = noreply+btp_usage_hackathon@sap.corp
+  EMAIL_TO       = jaye.li@sap.com
 
   CONTRACT_CU    = 100000
   CONTRACT_START = 2026-01-01
   CONTRACT_END   = 2026-12-31
 """
 
-import io
 import json
 import logging
 import os
 import smtplib
 from datetime import datetime, timedelta, timezone
-from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Optional
 
-import matplotlib
-matplotlib.use("Agg")  # non-interactive backend — no display needed
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-import numpy as np
-
 from dotenv import load_dotenv
 from langchain_core.tools import tool
 
-from uas_tool import (
-    _fetch_usage,
-    _validate_date,
-    _last_n_days,
-)
+from uas_tool import _validate_date
 
 load_dotenv(override=False)
 logger = logging.getLogger(__name__)
 
+# ── Runtime credential override ───────────────────────────────────────────────
+_runtime_email_config: dict = {}
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _get_cfg(key: str, default: str = "") -> str:
+    return _runtime_email_config.get(key) or os.environ.get(key, default)
+
 
 def _get_recipients() -> list[str]:
-    raw = os.environ.get("EMAIL_TO", "")
+    raw = _get_cfg("EMAIL_TO", "jaye.li@sap.com")
     return [e.strip() for e in raw.split(",") if e.strip()]
 
 
-def _send_email(subject: str, html_body: str, inline_images: list[tuple[str, bytes]]) -> None:
-    """
-    Send an HTML email with inline PNG images via SMTP STARTTLS.
+# ── SMTP sender ───────────────────────────────────────────────────────────────
 
-    inline_images: list of (cid, png_bytes) — referenced as <img src="cid:..."> in HTML
-    """
-    smtp_host = os.environ.get("SMTP_HOST", "")
-    smtp_port = int(os.environ.get("SMTP_PORT", "587"))
-    smtp_user = os.environ.get("SMTP_USER", "")
-    smtp_pass = os.environ.get("SMTP_PASSWORD", "")
-    from_addr = os.environ.get("EMAIL_FROM", smtp_user)
+def _send_email(subject: str, html_body: str) -> None:
+    """Send a pure-HTML email (no inline image attachments needed)."""
+    import ssl as _ssl
+    from email.utils import formatdate
+
+    smtp_host = _get_cfg("SMTP_HOST", "")
+    smtp_port = int(_get_cfg("SMTP_PORT", "587"))
+    smtp_user = _get_cfg("SMTP_USER", "")
+    smtp_pass = _get_cfg("SMTP_PASSWORD", "")
+    from_addr = _get_cfg("EMAIL_FROM", "noreply+btp_usage_hackathon@sap.corp")
     to_addrs  = _get_recipients()
 
-    if not smtp_host or not smtp_user or not to_addrs:
-        raise ValueError(
-            "Email not configured. Set SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO in .env"
-        )
+    if not smtp_host:
+        raise ValueError("SMTP_HOST is not configured.")
 
-    msg = MIMEMultipart("related")
+    msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"]    = from_addr
     msg["To"]      = ", ".join(to_addrs)
-
-    # Attach HTML body
+    msg["Date"]    = formatdate(localtime=False)
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
-    # Attach inline images
-    for cid, png_bytes in inline_images:
-        img = MIMEImage(png_bytes, "png")
-        img.add_header("Content-ID", f"<{cid}>")
-        img.add_header("Content-Disposition", "inline", filename=f"{cid}.png")
-        msg.attach(img)
+    ctx = _ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode    = _ssl.CERT_NONE
+    raw_msg = msg.as_bytes()
 
-    with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
-        server.ehlo()
-        server.starttls()
-        server.login(smtp_user, smtp_pass)
-        server.sendmail(from_addr, to_addrs, msg.as_string())
+    if smtp_port == 465:
+        logger.info("SMTP_SSL -> %s:%s", smtp_host, smtp_port)
+        with smtplib.SMTP_SSL(smtp_host, smtp_port, context=ctx, timeout=30) as s:
+            if smtp_user and smtp_pass:
+                s.login(smtp_user, smtp_pass)
+            s.sendmail(from_addr, to_addrs, raw_msg)
+    elif smtp_port == 587:
+        logger.info("SMTP STARTTLS -> %s:%s", smtp_host, smtp_port)
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as s:
+            s.ehlo()
+            s.starttls(context=ctx)
+            s.ehlo()
+            if smtp_user and smtp_pass:
+                s.login(smtp_user, smtp_pass)
+            s.sendmail(from_addr, to_addrs, raw_msg)
+    else:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as s:
+            s.ehlo()
+            if smtp_user and smtp_pass:
+                s.login(smtp_user, smtp_pass)
+            s.sendmail(from_addr, to_addrs, raw_msg)
 
-    logger.info("Email sent to %s: %s", to_addrs, subject)
+    logger.info("Email sent to %s -- %s", to_addrs, subject)
 
 
-# ── Chart generators ──────────────────────────────────────────────────────────
+# ============================================================================
+# Pure-Python SVG / HTML chart generators
+# No external libraries -- generates SVG markup as Python f-strings.
+# ============================================================================
 
-def _chart_daily_cu(daily_series: list[dict]) -> bytes:
-    """Bar chart: daily AI Core CU for last N days."""
+_PALETTE = ["#3498db", "#2ecc71", "#e74c3c", "#f39c12", "#9b59b6",
+            "#1abc9c", "#e67e22", "#34495e", "#95a5a6", "#c0392b"]
+
+
+def _svg_bar_chart(daily_series: list, title: str = "Daily AI Core CU Usage") -> str:
+    """SVG bar chart for daily CU. Returns full HTML block with embedded SVG."""
     if not daily_series:
-        return b""
+        return ""
 
-    dates  = [d["date"][-5:] for d in daily_series]   # MM-DD
-    values = [d["total_cu"] for d in daily_series]
-    avg    = sum(values) / len(values) if values else 0
+    labels = [(d.get("date") or d.get("period") or "")[-5:] for d in daily_series]
+    values = [float(d.get("total_cu") or d.get("cu") or 0) for d in daily_series]
 
-    fig, ax = plt.subplots(figsize=(8, 3.5))
-    colors = ["#e74c3c" if v > avg * 1.5 else "#3498db" for v in values]
-    ax.bar(dates, values, color=colors, edgecolor="white", linewidth=0.5)
-    ax.axhline(avg, color="#e67e22", linewidth=1.5, linestyle="--", label=f"Avg {avg:.0f} CU")
-    ax.set_title("AI Core Daily CU Usage", fontsize=13, fontweight="bold", pad=10)
-    ax.set_xlabel("Date")
-    ax.set_ylabel("CU")
-    ax.legend(fontsize=9)
-    ax.yaxis.grid(True, alpha=0.3)
-    ax.set_axisbelow(True)
-    plt.xticks(rotation=45, ha="right", fontsize=8)
-    plt.tight_layout()
+    if not any(v > 0 for v in values):
+        return ""
 
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
-    plt.close(fig)
-    return buf.getvalue()
+    W, H       = 620, 240
+    pad_l      = 62
+    pad_r      = 20
+    pad_top    = 30
+    pad_bot    = 50
+    chart_w    = W - pad_l - pad_r
+    chart_h    = H - pad_top - pad_bot
+    n          = len(values)
+    max_val    = max(values) or 1
+    avg        = sum(values) / n if n else 0
+    bar_w      = max(4, chart_w // n - 4)
+
+    def x_pos(i):
+        slot = chart_w / n
+        return pad_l + i * slot + (slot - bar_w) / 2
+
+    def y_bar(v):
+        return pad_top + chart_h * (1 - v / max_val)
+
+    def bar_h(v):
+        return chart_h * v / max_val
+
+    # Y-axis grid lines
+    grid_lines = ""
+    y_labels   = ""
+    for i in range(5):
+        v  = max_val * i / 4
+        y  = pad_top + chart_h * (1 - i / 4)
+        grid_lines += f'<line x1="{pad_l}" y1="{y:.1f}" x2="{W - pad_r}" y2="{y:.1f}" stroke="#e8e8e8" stroke-width="1"/>'
+        lbl = f"{v/1000:.1f}k" if v >= 1000 else f"{v:.0f}"
+        y_labels += f'<text x="{pad_l - 6}" y="{y + 4:.1f}" text-anchor="end" font-size="10" fill="#888">{lbl}</text>'
+
+    # Bars
+    bars = ""
+    for i, (v, lbl) in enumerate(zip(values, labels)):
+        color = "#e74c3c" if v > avg * 1.5 else "#3498db"
+        bx    = x_pos(i)
+        by_   = y_bar(v)
+        bh    = bar_h(v)
+        bars += f'<rect x="{bx:.1f}" y="{by_:.1f}" width="{bar_w}" height="{bh:.1f}" fill="{color}" rx="2"/>'
+        if n <= 14 or i % 2 == 0:
+            cx = bx + bar_w / 2
+            bars += (
+                f'<text x="{cx:.1f}" y="{H - pad_bot + 14}" text-anchor="middle" '
+                f'font-size="9" fill="#666" '
+                f'transform="rotate(-35 {cx:.1f} {H - pad_bot + 14})">{lbl}</text>'
+            )
+
+    # Average dashed line
+    avg_y    = pad_top + chart_h * (1 - avg / max_val)
+    avg_line = (
+        f'<line x1="{pad_l}" y1="{avg_y:.1f}" x2="{W - pad_r}" y2="{avg_y:.1f}" '
+        f'stroke="#e67e22" stroke-width="1.5" stroke-dasharray="5,3"/>'
+        f'<text x="{W - pad_r - 4}" y="{avg_y - 4:.1f}" text-anchor="end" '
+        f'font-size="9" fill="#e67e22">avg {avg:,.0f}</text>'
+    )
+
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
+        f'style="font-family:Arial,sans-serif;background:white;border-radius:6px;">'
+        f'<text x="{W//2}" y="18" text-anchor="middle" font-size="13" font-weight="bold" fill="#2c3e50">{title}</text>'
+        f'{grid_lines}{avg_line}{bars}{y_labels}'
+        f'<line x1="{pad_l}" y1="{pad_top}" x2="{pad_l}" y2="{pad_top + chart_h}" stroke="#ccc" stroke-width="1"/>'
+        f'<line x1="{pad_l}" y1="{pad_top + chart_h}" x2="{W - pad_r}" y2="{pad_top + chart_h}" stroke="#ccc" stroke-width="1"/>'
+        f'<rect x="{pad_l + 8}" y="{pad_top + 6}" width="10" height="4" fill="#e74c3c" rx="1"/>'
+        f'<text x="{pad_l + 22}" y="{pad_top + 12}" font-size="9" fill="#666">Spike (&gt;1.5x avg)</text>'
+        f'<rect x="{pad_l + 110}" y="{pad_top + 6}" width="10" height="4" fill="#3498db" rx="1"/>'
+        f'<text x="{pad_l + 124}" y="{pad_top + 12}" font-size="9" fill="#666">Normal</text>'
+        f'</svg>'
+    )
+    return f'<div style="margin:12px 0;text-align:center;">{svg}</div>'
 
 
-def _chart_model_pie(by_model: list[dict]) -> bytes:
-    """Pie chart: CU share by AI model."""
+def _svg_line_chart(daily_series: list, anomaly_dates: set,
+                    title: str = "AI Core CU Trend") -> str:
+    """SVG area/line chart with anomaly markers. Returns full HTML block."""
+    if not daily_series:
+        return ""
+
+    labels     = [(d.get("date") or d.get("period") or "")[-5:] for d in daily_series]
+    full_dates = [(d.get("date") or d.get("period") or "") for d in daily_series]
+    values     = [float(d.get("total_cu") or 0) for d in daily_series]
+
+    if not any(v > 0 for v in values):
+        return ""
+
+    W, H    = 620, 220
+    pad_l   = 62
+    pad_r   = 20
+    pad_top = 30
+    pad_bot = 50
+    chart_w = W - pad_l - pad_r
+    chart_h = H - pad_top - pad_bot
+    n       = len(values)
+    max_val = max(values) or 1
+
+    def px(i):
+        return pad_l + (i / (n - 1)) * chart_w if n > 1 else pad_l + chart_w / 2
+
+    def py(v):
+        return pad_top + chart_h * (1 - v / max_val)
+
+    # Grid
+    grid_lines = ""
+    y_labels   = ""
+    for i in range(5):
+        v  = max_val * i / 4
+        y  = pad_top + chart_h * (1 - i / 4)
+        grid_lines += f'<line x1="{pad_l}" y1="{y:.1f}" x2="{W - pad_r}" y2="{y:.1f}" stroke="#eee" stroke-width="1"/>'
+        lbl = f"{v/1000:.1f}k" if v >= 1000 else f"{v:.0f}"
+        y_labels += f'<text x="{pad_l - 6}" y="{y + 4:.1f}" text-anchor="end" font-size="10" fill="#888">{lbl}</text>'
+
+    # Points list
+    pts = [(px(i), py(v)) for i, v in enumerate(values)]
+
+    # Area fill
+    base_y = pad_top + chart_h
+    area_d = f"M {pts[0][0]:.1f},{pts[0][1]:.1f} " + " ".join(f"L {x:.1f},{y:.1f}" for x, y in pts[1:])
+    area_d += f" L {pts[-1][0]:.1f},{base_y} L {pts[0][0]:.1f},{base_y} Z"
+    area   = f'<path d="{area_d}" fill="#3498db" fill-opacity="0.15"/>'
+
+    line_d = f"M {pts[0][0]:.1f},{pts[0][1]:.1f} " + " ".join(f"L {x:.1f},{y:.1f}" for x, y in pts[1:])
+    line   = f'<path d="{line_d}" fill="none" stroke="#3498db" stroke-width="2"/>'
+
+    # X labels
+    x_labels = ""
+    for i, lbl in enumerate(labels):
+        if n <= 14 or i % 2 == 0:
+            x = px(i)
+            x_labels += (
+                f'<text x="{x:.1f}" y="{H - pad_bot + 14}" text-anchor="middle" '
+                f'font-size="9" fill="#666" '
+                f'transform="rotate(-35 {x:.1f} {H - pad_bot + 14})">{lbl}</text>'
+            )
+
+    # Anomaly markers
+    markers = ""
+    for i, fd in enumerate(full_dates):
+        if fd in anomaly_dates:
+            x, y = pts[i]
+            markers += f'<circle cx="{x:.1f}" cy="{y:.1f}" r="5" fill="#e74c3c" stroke="white" stroke-width="1.5"/>'
+
+    legend = ""
+    if anomaly_dates:
+        legend = (
+            f'<circle cx="{pad_l + 10}" cy="{pad_top + 10}" r="4" fill="#e74c3c"/>'
+            f'<text x="{pad_l + 18}" y="{pad_top + 14}" font-size="9" fill="#666">Anomaly</text>'
+        )
+
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
+        f'style="font-family:Arial,sans-serif;background:white;border-radius:6px;">'
+        f'<text x="{W//2}" y="18" text-anchor="middle" font-size="13" font-weight="bold" fill="#2c3e50">{title}</text>'
+        f'{grid_lines}{area}{line}{markers}{x_labels}{y_labels}{legend}'
+        f'<line x1="{pad_l}" y1="{pad_top}" x2="{pad_l}" y2="{pad_top + chart_h}" stroke="#ccc" stroke-width="1"/>'
+        f'<line x1="{pad_l}" y1="{pad_top + chart_h}" x2="{W - pad_r}" y2="{pad_top + chart_h}" stroke="#ccc" stroke-width="1"/>'
+        f'</svg>'
+    )
+    return f'<div style="margin:12px 0;text-align:center;">{svg}</div>'
+
+
+def _html_model_bars(by_model: list) -> str:
+    """Horizontal bar chart rendered as HTML divs -- 100% email-safe, no images."""
     if not by_model:
-        return b""
+        return ""
 
-    # Cap at top 6 models, group the rest as "Other"
-    top    = by_model[:6]
-    other  = sum(m["total_cu"] for m in by_model[6:])
-    labels = [m["model"].split("--")[-1][:20] for m in top]
-    sizes  = [m["total_cu"] for m in top]
-    if other > 0:
-        labels.append("Other")
-        sizes.append(other)
+    top    = by_model[:8]
+    max_cu = float(top[0]["total_cu"]) if top else 1
+    if max_cu == 0:
+        return ""
 
-    colors = ["#3498db", "#2ecc71", "#e74c3c", "#f39c12", "#9b59b6", "#1abc9c", "#95a5a6"]
+    rows = ""
+    for i, m in enumerate(top):
+        cu    = float(m["total_cu"])
+        pct   = cu / max_cu * 100
+        color = _PALETTE[i % len(_PALETTE)]
+        # Show readable name: prefer the part before '--version' suffix
+        raw_model = m["model"]
+        label = raw_model.split("--")[0][:35] if "--" in raw_model else raw_model[:35]
+        rows += (
+            f'<tr>'
+            f'<td style="padding:5px 8px;font-size:12px;color:#444;width:180px;'
+            f'white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{label}</td>'
+            f'<td style="padding:5px 4px;">'
+            f'<div style="background:{color};width:{pct:.1f}%;min-width:4px;height:16px;border-radius:3px;"></div>'
+            f'</td>'
+            f'<td style="padding:5px 8px;font-size:12px;color:#555;text-align:right;width:90px;">{cu:,.1f} CU</td>'
+            f'</tr>'
+        )
 
-    fig, ax = plt.subplots(figsize=(6, 4))
-    wedges, texts, autotexts = ax.pie(
-        sizes, labels=None, autopct="%1.1f%%",
-        colors=colors[:len(sizes)], startangle=140,
-        wedgeprops={"edgecolor": "white", "linewidth": 1},
+    return (
+        f'<div style="margin:12px 0;background:white;border-radius:6px;padding:12px 0;">'
+        f'<p style="margin:0 0 10px 0;font-size:13px;font-weight:bold;color:#2c3e50;text-align:center;">'
+        f'CU Share by Model</p>'
+        f'<table style="width:100%;border-collapse:collapse;">{rows}</table>'
+        f'</div>'
     )
-    for at in autotexts:
-        at.set_fontsize(8)
-    ax.legend(
-        wedges, labels,
-        loc="center left", bbox_to_anchor=(1, 0.5),
-        fontsize=8, frameon=False,
+
+
+def _html_quota_bar(cu_used: float, contract_cu: float, projected: float) -> str:
+    """Horizontal stacked progress bar -- pure HTML/CSS."""
+    if not contract_cu:
+        return ""
+
+    used_pct = min(cu_used / contract_cu * 100, 100)
+    proj_pct = min(projected / contract_cu * 100, 100)
+    extra    = max(0.0, proj_pct - used_pct)
+    remain   = max(0.0, 100.0 - proj_pct)
+
+    proj_color = "#27ae60" if proj_pct < 80 else ("#e67e22" if proj_pct < 100 else "#e74c3c")
+
+    return (
+        f'<div style="margin:12px 0;background:white;border-radius:6px;padding:16px;">'
+        f'<p style="margin:0 0 8px 0;font-size:13px;font-weight:bold;color:#2c3e50;">Annual CU Quota Progress</p>'
+        f'<div style="background:#ecf0f1;border-radius:8px;height:28px;overflow:hidden;">'
+        f'<div style="float:left;background:#3498db;width:{used_pct:.1f}%;height:28px;" title="Used: {cu_used:,.0f} CU"></div>'
+        f'<div style="float:left;background:#f39c12;opacity:0.8;width:{extra:.1f}%;height:28px;" title="Projected extra"></div>'
+        f'<div style="float:left;background:#ecf0f1;width:{remain:.1f}%;height:28px;"></div>'
+        f'</div>'
+        f'<div style="margin-top:8px;font-size:11px;color:#666;">'
+        f'<span style="margin-right:16px;">'
+        f'<span style="display:inline-block;width:10px;height:10px;background:#3498db;border-radius:2px;margin-right:4px;vertical-align:middle;"></span>'
+        f'Used: {cu_used:,.0f} CU ({used_pct:.1f}%)</span>'
+        f'<span style="margin-right:16px;">'
+        f'<span style="display:inline-block;width:10px;height:10px;background:#f39c12;border-radius:2px;margin-right:4px;vertical-align:middle;"></span>'
+        f'Projected: {projected:,.0f} CU ({proj_pct:.1f}%)</span>'
+        f'<span style="color:{proj_color};font-weight:bold;">Contract: {contract_cu:,.0f} CU</span>'
+        f'</div>'
+        f'</div>'
     )
-    ax.set_title("CU Share by Model", fontsize=13, fontweight="bold")
-    plt.tight_layout()
-
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
-    plt.close(fig)
-    return buf.getvalue()
 
 
-def _chart_quota_progress(cu_used: float, contract_cu: float, projected: float) -> bytes:
-    """Horizontal stacked bar: used / remaining / at-risk zone."""
-    fig, ax = plt.subplots(figsize=(8, 1.8))
+# ============================================================================
+# CSS stylesheet
+# ============================================================================
 
-    used_pct      = min(cu_used / contract_cu, 1.0)
-    projected_pct = min(projected / contract_cu, 1.0)
-
-    ax.barh(["Quota"], [used_pct], color="#3498db", label=f"Used ({cu_used:,.0f} CU)")
-    if projected_pct > used_pct:
-        ax.barh(["Quota"], [projected_pct - used_pct], left=[used_pct],
-                color="#f39c12", alpha=0.6, label=f"Projected ({projected:,.0f} CU)")
-    ax.barh(["Quota"], [max(0, 1.0 - projected_pct)], left=[min(projected_pct, 1.0)],
-            color="#ecf0f1", label=f"Contract ({contract_cu:,.0f} CU)")
-    ax.axvline(1.0, color="#e74c3c", linewidth=2, linestyle="--")
-
-    ax.set_xlim(0, max(1.1, projected_pct + 0.05))
-    ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x*100:.0f}%"))
-    ax.set_title("Annual CU Quota Progress", fontsize=11, fontweight="bold")
-    ax.legend(fontsize=8, loc="lower right")
-    ax.yaxis.set_visible(False)
-    plt.tight_layout()
-
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
-    plt.close(fig)
-    return buf.getvalue()
+_CSS = (
+    "body{font-family:Arial,sans-serif;background:#f4f6f9;margin:0;padding:20px;}"
+    ".wrap{max-width:680px;margin:auto;background:white;border-radius:8px;overflow:hidden;"
+    "box-shadow:0 2px 8px rgba(0,0,0,.1);}"
+    ".hdr{background:#2c3e50;color:white;padding:22px 28px;}"
+    ".hdr h1{margin:0;font-size:19px;}"
+    ".hdr p{margin:4px 0 0;opacity:.8;font-size:12px;}"
+    ".badge-safe{background:#27ae60;color:white;padding:3px 10px;border-radius:10px;font-size:11px;font-weight:bold;}"
+    ".badge-risk{background:#e67e22;color:white;padding:3px 10px;border-radius:10px;font-size:11px;font-weight:bold;}"
+    ".badge-exceed{background:#e74c3c;color:white;padding:3px 10px;border-radius:10px;font-size:11px;font-weight:bold;}"
+    ".sec{padding:18px 28px;border-bottom:1px solid #ecf0f1;}"
+    ".sec h2{font-size:14px;color:#2c3e50;margin:0 0 12px;border-left:4px solid #3498db;padding-left:9px;}"
+    "table{width:100%;border-collapse:collapse;font-size:13px;}"
+    "th{background:#f8f9fa;color:#555;text-align:left;padding:7px 9px;font-weight:600;}"
+    "td{padding:6px 9px;border-bottom:1px solid #f0f0f0;}"
+    "tr:last-child td{border-bottom:none;}"
+    ".num{text-align:right;font-family:monospace;}"
+    ".ok{color:#27ae60;font-weight:bold;}.warn{color:#e67e22;font-weight:bold;}.err{color:#e74c3c;font-weight:bold;}"
+    ".ftr{padding:14px 28px;background:#f8f9fa;font-size:11px;color:#999;text-align:center;}"
+)
 
 
-def _chart_anomaly_trend(daily_series: list[dict], anomaly_dates: set) -> bytes:
-    """Line chart: daily CU trend with anomaly days highlighted in red."""
-    if not daily_series:
-        return b""
+# ============================================================================
+# HTML builders
+# ============================================================================
 
-    dates  = [d["date"][-5:] for d in daily_series]
-    values = [d["total_cu"] for d in daily_series]
-    colors = ["#e74c3c" if d["date"] in anomaly_dates else "#3498db" for d in daily_series]
-
-    fig, ax = plt.subplots(figsize=(8, 3.5))
-    ax.plot(dates, values, color="#3498db", linewidth=2, zorder=2)
-    ax.fill_between(range(len(dates)), values, alpha=0.15, color="#3498db")
-
-    # Highlight anomaly dots
-    for i, (d, v) in enumerate(zip(daily_series, values)):
-        if d["date"] in anomaly_dates:
-            ax.scatter(i, v, color="#e74c3c", s=80, zorder=3)
-
-    ax.set_xticks(range(len(dates)))
-    ax.set_xticklabels(dates, rotation=45, ha="right", fontsize=8)
-    ax.set_title("AI Core CU Daily Trend (anomalies in red)", fontsize=12, fontweight="bold")
-    ax.set_ylabel("CU")
-    ax.yaxis.grid(True, alpha=0.3)
-    ax.set_axisbelow(True)
-
-    normal_patch  = mpatches.Patch(color="#3498db", label="Normal")
-    anomaly_patch = mpatches.Patch(color="#e74c3c", label="Anomaly")
-    ax.legend(handles=[normal_patch, anomaly_patch], fontsize=9)
-    plt.tight_layout()
-
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
-    plt.close(fig)
-    return buf.getvalue()
-
-
-# ── HTML builders ─────────────────────────────────────────────────────────────
-
-_CSS = """
-body { font-family: Arial, sans-serif; background: #f4f6f9; margin: 0; padding: 20px; }
-.container { max-width: 700px; margin: auto; background: white;
-             border-radius: 8px; overflow: hidden;
-             box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
-.header { background: #2c3e50; color: white; padding: 24px 30px; }
-.header h1 { margin: 0; font-size: 20px; }
-.header p  { margin: 4px 0 0; opacity: 0.8; font-size: 13px; }
-.badge-safe    { background: #27ae60; color: white; padding: 4px 12px;
-                 border-radius: 12px; font-size: 12px; font-weight: bold; }
-.badge-risk    { background: #e67e22; color: white; padding: 4px 12px;
-                 border-radius: 12px; font-size: 12px; font-weight: bold; }
-.badge-exceed  { background: #e74c3c; color: white; padding: 4px 12px;
-                 border-radius: 12px; font-size: 12px; font-weight: bold; }
-.section { padding: 20px 30px; border-bottom: 1px solid #ecf0f1; }
-.section h2 { font-size: 15px; color: #2c3e50; margin: 0 0 14px;
-              border-left: 4px solid #3498db; padding-left: 10px; }
-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-th { background: #f8f9fa; color: #555; text-align: left;
-     padding: 8px 10px; font-weight: 600; }
-td { padding: 7px 10px; border-bottom: 1px solid #f0f0f0; }
-tr:last-child td { border-bottom: none; }
-.num { text-align: right; font-family: monospace; }
-.ok   { color: #27ae60; font-weight: bold; }
-.warn { color: #e67e22; font-weight: bold; }
-.err  { color: #e74c3c; font-weight: bold; }
-.chart { text-align: center; padding: 10px 0; }
-.footer { padding: 16px 30px; background: #f8f9fa;
-          font-size: 11px; color: #999; text-align: center; }
-"""
-
-
-def _status_badge(verdict: str) -> str:
+def _badge(verdict: str) -> str:
     cls = {"SAFE": "badge-safe", "AT_RISK": "badge-risk", "WILL_EXCEED": "badge-exceed"}.get(verdict, "badge-risk")
     return f'<span class="{cls}">{verdict.replace("_", " ")}</span>'
 
 
-def _status_class(status: str) -> str:
+def _sc(status: str) -> str:
     return {"ON_TRACK": "ok", "SAFE": "ok", "AHEAD": "ok",
             "AT_RISK": "warn", "BEHIND": "warn",
             "OVER": "err", "WILL_EXCEED": "err"}.get(status, "")
@@ -280,196 +397,171 @@ def _status_class(status: str) -> str:
 def _build_report_html(
     from_date: str,
     to_date: str,
-    services_rows: list[dict],
-    aicore_by_model: list[dict],
-    aicore_daily: list[dict],
-    quota: Optional[dict],
-    hana_summary: Optional[dict],
-    chart_cids: dict,
+    services_rows: list,
+    aicore_by_model: list,
+    aicore_daily: list,
+    quota,
+    hana_summary,
 ) -> str:
     today_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     verdict   = quota.get("verdict", "SAFE") if quota else "SAFE"
 
-    # ── Services table rows ───────────────────────────────────────────────────
-    svc_rows_html = ""
-    for row in services_rows[:20]:  # cap at 20 rows
-        svc_rows_html += (
-            f"<tr><td>{row['service']}</td><td>{row['metric']}</td>"
-            f"<td class='num'>{row['total_usage']:,.2f}</td>"
-            f"<td>{row['unit']}</td></tr>"
-        )
+    bar_chart_html  = _svg_bar_chart(aicore_daily)
+    model_bars_html = _html_model_bars(aicore_by_model)
 
-    # ── AI Core model table rows ──────────────────────────────────────────────
-    model_rows_html = ""
-    for m in aicore_by_model[:8]:
-        model_rows_html += (
-            f"<tr><td>{m['model']}</td>"
-            f"<td class='num'>{m['total_cu']:,.2f} CU</td></tr>"
-        )
-
-    # ── Quota section ─────────────────────────────────────────────────────────
-    quota_html = ""
+    quota_bar_html   = ""
+    quota_table_html = ""
     if quota:
         tm   = quota.get("this_month", {})
         cum  = quota.get("cumulative", {})
         proj = quota.get("projection", {})
-        quota_html = f"""
-        <div class="section">
-          <h2>Annual Quota Status</h2>
-          {'<div class="chart"><img src="cid:chart_quota" width="640"></div>' if chart_cids.get("chart_quota") else ""}
-          <table>
-            <tr><th>Metric</th><th>Value</th><th>Status</th></tr>
-            <tr>
-              <td>This month ({tm.get('month','')})</td>
-              <td class="num">{tm.get('used',0):,.1f} / {tm.get('target',0):,.1f} CU
-                  ({tm.get('pct_used',0):.1f}%)</td>
-              <td class="{_status_class(tm.get('status',''))}">{tm.get('status','')}</td>
-            </tr>
-            <tr>
-              <td>Cumulative YTD</td>
-              <td class="num">{cum.get('used',0):,.1f} / {cum.get('allowed',0):,.1f} CU</td>
-              <td class="{_status_class(cum.get('status',''))}">{cum.get('status','')}</td>
-            </tr>
-            <tr>
-              <td>Year-end projection</td>
-              <td class="num">{proj.get('projected_annual',0):,.1f} CU</td>
-              <td class="{_status_class(proj.get('status',''))}">{proj.get('status','')}</td>
-            </tr>
-          </table>
-        </div>"""
+        quota_bar_html = _html_quota_bar(
+            cum.get("used", 0),
+            quota.get("contract", {}).get("contract_cu", 0),
+            proj.get("projected_annual", 0),
+        )
+        quota_table_html = (
+            f'<table><tr><th>Metric</th><th>Value</th><th>Status</th></tr>'
+            f'<tr><td>This month ({tm.get("month","")})</td>'
+            f'<td class="num">{tm.get("used",0):,.1f} / {tm.get("target",0):,.1f} CU ({tm.get("pct_used",0):.1f}%)</td>'
+            f'<td class="{_sc(tm.get("status",""))}">{tm.get("status","")}</td></tr>'
+            f'<tr><td>Cumulative YTD</td>'
+            f'<td class="num">{cum.get("used",0):,.1f} / {cum.get("allowed",0):,.1f} CU</td>'
+            f'<td class="{_sc(cum.get("status",""))}">{cum.get("status","")}</td></tr>'
+            f'<tr><td>Year-end projection</td>'
+            f'<td class="num">{proj.get("projected_annual",0):,.1f} CU</td>'
+            f'<td class="{_sc(proj.get("status",""))}">{proj.get("status","")}</td></tr>'
+            f'</table>'
+        )
 
-    # ── HANA section ──────────────────────────────────────────────────────────
-    hana_html = ""
+    model_table_rows = ""
+    for m in aicore_by_model[:8]:
+        model_table_rows += (
+            f'<tr><td>{m["model"]}</td>'
+            f'<td class="num">{m["total_cu"]:,.2f} CU</td></tr>'
+        )
+
+    svc_rows_html = ""
+    for row in services_rows[:20]:
+        svc_rows_html += (
+            f'<tr><td>{row["service"]}</td><td>{row["metric"]}</td>'
+            f'<td class="num">{row["total_usage"]:,.2f}</td>'
+            f'<td>{row["unit"]}</td></tr>'
+        )
+
+    hana_section = ""
     if hana_summary:
         hana_rows = ""
         for name, info in hana_summary.items():
             hana_rows += (
-                f"<tr><td>{name}</td>"
-                f"<td class='num'>{info.get('max_value', 'N/A')}</td>"
-                f"<td>{info.get('unit','')}</td></tr>"
+                f'<tr><td>{name}</td>'
+                f'<td class="num">{info.get("max_value","N/A")}</td>'
+                f'<td>{info.get("unit","")}</td></tr>'
             )
-        hana_html = f"""
-        <div class="section">
-          <h2>HANA Cloud Metrics (last 24h)</h2>
-          <table>
-            <tr><th>Metric</th><th class="num">Max Value</th><th>Unit</th></tr>
-            {hana_rows}
-          </table>
-        </div>"""
+        hana_section = (
+            f'<div class="sec"><h2>HANA Cloud Metrics (last 24h)</h2>'
+            f'<table><tr><th>Metric</th><th class="num">Max Value</th><th>Unit</th></tr>'
+            f'{hana_rows}</table></div>'
+        )
 
-    return f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8">
-<style>{_CSS}</style>
-</head><body>
-<div class="container">
-  <div class="header">
-    <h1>BTP Daily Usage Report &nbsp; {_status_badge(verdict)}</h1>
-    <p>Period: {from_date} to {to_date} &nbsp;|&nbsp; Generated: {today_str}</p>
-  </div>
+    quota_section = ""
+    if quota:
+        quota_section = (
+            f'<div class="sec"><h2>Annual Quota Status</h2>'
+            f'{quota_bar_html}{quota_table_html}</div>'
+        )
 
-  <div class="section">
-    <h2>AI Core CU — Daily Trend</h2>
-    {'<div class="chart"><img src="cid:chart_daily" width="640"></div>' if chart_cids.get("chart_daily") else ""}
-    <table>
-      <tr><th>Model</th><th class="num">Total CU</th></tr>
-      {model_rows_html}
-    </table>
-    {'<div class="chart"><img src="cid:chart_pie" width="480"></div>' if chart_cids.get("chart_pie") else ""}
-  </div>
-
-  {quota_html}
-
-  {hana_html}
-
-  <div class="section">
-    <h2>All BTP Services</h2>
-    <table>
-      <tr><th>Service</th><th>Metric</th><th class="num">Usage</th><th>Unit</th></tr>
-      {svc_rows_html}
-    </table>
-  </div>
-
-  <div class="footer">
-    BTP Usage Agent &nbsp;|&nbsp; Auto-generated report &nbsp;|&nbsp; {today_str}
-  </div>
-</div>
-</body></html>"""
+    return (
+        f'<!DOCTYPE html><html><head><meta charset="utf-8"><style>{_CSS}</style></head>'
+        f'<body><div class="wrap">'
+        f'<div class="hdr">'
+        f'<h1>BTP Daily Usage Report &nbsp; {_badge(verdict)}</h1>'
+        f'<p>Period: {from_date} to {to_date} &nbsp;|&nbsp; Generated: {today_str}</p>'
+        f'</div>'
+        f'<div class="sec"><h2>AI Core -- Daily CU Usage</h2>'
+        f'{bar_chart_html}'
+        f'<table><tr><th>Model</th><th class="num">Total CU</th></tr>{model_table_rows}</table>'
+        f'{model_bars_html}</div>'
+        f'{quota_section}'
+        f'{hana_section}'
+        f'<div class="sec"><h2>All BTP Services</h2>'
+        f'<table><tr><th>Service</th><th>Metric</th><th class="num">Usage</th><th>Unit</th></tr>'
+        f'{svc_rows_html}</table></div>'
+        f'<div class="ftr">BTP Usage Agent &nbsp;|&nbsp; Auto-generated &nbsp;|&nbsp; {today_str}</div>'
+        f'</div></body></html>'
+    )
 
 
-def _build_anomaly_html(anomaly_result: dict, chart_bytes: bytes) -> str:
-    from_date = anomaly_result.get("from_date", "")
-    to_date   = anomaly_result.get("to_date", "")
-    algorithm = anomaly_result.get("algorithm_used", "")
-    sensitivity = anomaly_result.get("sensitivity", "")
-    total_anomalies   = anomaly_result.get("total_daily_anomalies", [])
-    per_model         = anomaly_result.get("per_model_anomalies", {})
-    today_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+def _build_anomaly_html(anomaly_result: dict) -> str:
+    from_date       = anomaly_result.get("from_date", "")
+    to_date         = anomaly_result.get("to_date", "")
+    algorithm       = anomaly_result.get("algorithm_used", "")
+    sensitivity     = anomaly_result.get("sensitivity", "")
+    total_anomalies = anomaly_result.get("total_daily_anomalies", [])
+    per_model       = anomaly_result.get("per_model_anomalies", {})
+    today_str       = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    daily_series  = anomaly_result.get("data_summary", {}).get("daily_series", [])
+    anomaly_dates = {a["date"] for a in total_anomalies}
+    for anoms in per_model.values():
+        for a in anoms:
+            anomaly_dates.add(a["date"])
+
+    trend_chart = _svg_line_chart(daily_series, anomaly_dates,
+                                  title="AI Core CU Trend (anomalies in red)")
 
     anomaly_rows = ""
     for a in total_anomalies:
         anomaly_rows += (
-            f"<tr><td>{a['date']}</td>"
-            f"<td class='num err'>{a['value']:,.2f} CU</td>"
-            f"<td>{a['direction'].upper()}</td>"
-            f"<td class='num'>{a['score']:.2f} ({a['score_type']})</td>"
-            f"<td>{a['pct_vs_mean']:+.1f}%</td></tr>"
+            f'<tr><td>{a["date"]}</td>'
+            f'<td class="num err">{a["value"]:,.2f} CU</td>'
+            f'<td>{a["direction"].upper()}</td>'
+            f'<td class="num">{a["score"]:.2f} ({a["score_type"]})</td>'
+            f'<td>{a["pct_vs_mean"]:+.1f}%</td></tr>'
         )
 
     model_rows = ""
     for model, anomalies in per_model.items():
         for a in anomalies:
             model_rows += (
-                f"<tr><td>{model.split('--')[-1][:30]}</td>"
-                f"<td>{a['date']}</td>"
-                f"<td class='num err'>{a['value']:,.2f} CU</td>"
-                f"<td class='num'>{a['score']:.2f}</td>"
-                f"<td>{a.get('pct_vs_mean', a.get('pct_vs_median', 0)):+.1f}%</td></tr>"
+                f'<tr><td>{(model.split("--")[0] if "--" in model else model)[:30]}</td>'
+                f'<td>{a["date"]}</td>'
+                f'<td class="num err">{a["value"]:,.2f} CU</td>'
+                f'<td class="num">{a["score"]:.2f}</td>'
+                f'<td>{a.get("pct_vs_mean", a.get("pct_vs_median", 0)):+.1f}%</td></tr>'
             )
 
-    chart_img = '<div class="chart"><img src="cid:chart_anomaly" width="640"></div>' if chart_bytes else ""
+    trend_sec = f'<div class="sec"><h2>Daily Trend with Anomalies</h2>{trend_chart}</div>' if trend_chart else ""
+    anom_sec  = (f'<div class="sec"><h2>Daily CU Anomalies</h2>'
+                 f'<table><tr><th>Date</th><th class="num">CU</th><th>Direction</th>'
+                 f'<th class="num">Score</th><th>vs Mean</th></tr>{anomaly_rows}</table></div>') if anomaly_rows else ""
+    model_sec = (f'<div class="sec"><h2>Per-Model Anomalies</h2>'
+                 f'<table><tr><th>Model</th><th>Date</th><th class="num">CU</th>'
+                 f'<th class="num">Score</th><th>vs Mean</th></tr>{model_rows}</table></div>') if model_rows else ""
 
-    return f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8">
-<style>{_CSS}</style>
-</head><body>
-<div class="container">
-  <div class="header" style="background:#c0392b;">
-    <h1>&#9888; AI Core CU Anomaly Alert</h1>
-    <p>Period: {from_date} to {to_date} &nbsp;|&nbsp;
-       Algorithm: {algorithm} &nbsp;|&nbsp; Sensitivity: {sensitivity} &nbsp;|&nbsp;
-       Generated: {today_str}</p>
-  </div>
-
-  <div class="section">
-    <h2>Daily Trend with Anomaly Days Highlighted</h2>
-    {chart_img}
-  </div>
-
-  {'<div class="section"><h2>Total Daily CU Anomalies</h2><table><tr><th>Date</th><th class="num">CU Value</th><th>Direction</th><th class="num">Score</th><th>vs Mean</th></tr>' + anomaly_rows + '</table></div>' if anomaly_rows else ''}
-
-  {'<div class="section"><h2>Per-Model Anomalies</h2><table><tr><th>Model</th><th>Date</th><th class="num">CU Value</th><th class="num">Score</th><th>vs Mean</th></tr>' + model_rows + '</table></div>' if model_rows else ''}
-
-  <div class="footer">
-    BTP Usage Agent &nbsp;|&nbsp; Anomaly Alert &nbsp;|&nbsp; {today_str}
-  </div>
-</div>
-</body></html>"""
+    return (
+        f'<!DOCTYPE html><html><head><meta charset="utf-8"><style>{_CSS}</style></head>'
+        f'<body><div class="wrap">'
+        f'<div class="hdr" style="background:#c0392b;">'
+        f'<h1>&#9888; AI Core CU Anomaly Alert</h1>'
+        f'<p>Period: {from_date} to {to_date} &nbsp;|&nbsp; '
+        f'Algorithm: {algorithm} &nbsp;|&nbsp; Sensitivity: {sensitivity} &nbsp;|&nbsp; {today_str}</p>'
+        f'</div>'
+        f'{trend_sec}{anom_sec}{model_sec}'
+        f'<div class="ftr">BTP Usage Agent &nbsp;|&nbsp; Anomaly Alert &nbsp;|&nbsp; {today_str}</div>'
+        f'</div></body></html>'
+    )
 
 
-# ── Core report builder (shared by all 3 email types) ─────────────────────────
+# ============================================================================
+# Report data fetcher
+# ============================================================================
 
-async def _fetch_and_build_report(from_date: str, to_date: str) -> tuple[str, list[tuple[str, bytes]]]:
-    """
-    Fetch all data, generate charts, build HTML.
-    Returns (html_string, [(cid, png_bytes), ...])
-    """
+async def _fetch_and_build_report(from_date: str, to_date: str) -> str:
+    """Fetch all BTP data, generate charts, return complete HTML string."""
     from uas_tool import get_btp_services_summary, get_aicore_model_cu_usage, check_quota_status
-    from hana_tool import _hana_get, _default_time_range_24h, _resolve_service_instance_id
 
-    inline_images: list[tuple[str, bytes]] = []
-    chart_cids: dict[str, bool] = {}
-
-    # ── 1. All BTP services summary ──────────────────────────────────────────
+    # 1. BTP services
     try:
         svc_raw  = json.loads(await get_btp_services_summary.ainvoke({"from_date": from_date, "to_date": to_date}))
         svc_rows = svc_raw.get("detail", [])
@@ -477,20 +569,25 @@ async def _fetch_and_build_report(from_date: str, to_date: str) -> tuple[str, li
         logger.warning("services summary failed: %s", exc)
         svc_rows = []
 
-    # ── 2. AI Core model breakdown ───────────────────────────────────────────
+    # 2. AI Core usage
     try:
-        aicore_raw   = json.loads(await get_aicore_model_cu_usage.ainvoke(
+        aicore_raw    = json.loads(await get_aicore_model_cu_usage.ainvoke(
             {"from_date": from_date, "to_date": to_date, "time_granularity": "day"}
         ))
         aicore_models  = aicore_raw.get("by_model", [])
-        aicore_by_period = aicore_raw.get("by_period", [])
+        aicore_periods = aicore_raw.get("by_period", [])
     except Exception as exc:
-        logger.warning("aicore model usage failed: %s", exc)
-        aicore_models    = []
-        aicore_by_period = []
+        logger.warning("aicore usage failed: %s", exc)
+        aicore_models  = []
+        aicore_periods = []
 
-    # ── 3. Quota status ──────────────────────────────────────────────────────
-    quota = None
+    daily_series = [
+        {"date": d.get("date") or d.get("period") or "", "total_cu": d.get("total_cu", 0)}
+        for d in aicore_periods
+    ]
+
+    # 3. Quota
+    quota          = None
     contract_cu    = float(os.environ.get("CONTRACT_CU", "0"))
     contract_start = os.environ.get("CONTRACT_START", "")
     contract_end   = os.environ.get("CONTRACT_END", "")
@@ -502,11 +599,12 @@ async def _fetch_and_build_report(from_date: str, to_date: str) -> tuple[str, li
                 "contract_end":   contract_end,
             }))
         except Exception as exc:
-            logger.warning("quota status failed: %s", exc)
+            logger.warning("quota failed: %s", exc)
 
-    # ── 4. HANA metrics (last 24h) ───────────────────────────────────────────
+    # 4. HANA (optional)
     hana_summary = None
     try:
+        from hana_tool import _hana_get, _default_time_range_24h, _resolve_service_instance_id
         sid = _resolve_service_instance_id(None)
         s_ts, e_ts = _default_time_range_24h()
         hana_raw = await _hana_get(
@@ -516,75 +614,225 @@ async def _fetch_and_build_report(from_date: str, to_date: str) -> tuple[str, li
              "aggregates": "max", "interval": 3600},
         )
         hana_summary = {}
-        units = {"HDBMemoryUsed": "bytes", "HDBCPU": "%", "HDBDiskUsed": "bytes"}
         for m in hana_raw.get("data", []):
             name   = m.get("name", "")
-            values = m.get("values", [])
-            if values:
-                max_val = max((v.get("max", 0) for v in values), default=0)
+            vals   = m.get("values", [])
+            if vals:
+                max_val = max((v.get("max", 0) for v in vals), default=0)
                 hana_summary[name] = {
-                    "max_value": round(max_val / (1024**3), 2) if "Used" in name else round(max_val, 2),
-                    "unit":      "GB" if "Used" in name else units.get(name, ""),
+                    "max_value": round(max_val / (1024 ** 3), 2) if "Used" in name else round(max_val, 2),
+                    "unit":      "GB" if "Used" in name else "%",
                 }
     except Exception as exc:
         logger.warning("HANA metrics failed (non-fatal): %s", exc)
 
-    # ── 5. Generate charts ───────────────────────────────────────────────────
-    daily_series = aicore_by_period if aicore_by_period else []
-
-    chart_daily = _chart_daily_cu(daily_series)
-    if chart_daily:
-        inline_images.append(("chart_daily", chart_daily))
-        chart_cids["chart_daily"] = True
-
-    # Flatten by_model for the no-breakdown totals
     model_totals = [{"model": m["model"], "total_cu": m["total_cu"]} for m in aicore_models]
-    chart_pie = _chart_model_pie(model_totals)
-    if chart_pie:
-        inline_images.append(("chart_pie", chart_pie))
-        chart_cids["chart_pie"] = True
 
-    if quota:
-        proj = quota.get("projection", {})
-        chart_q = _chart_quota_progress(
-            quota["cumulative"]["used"],
-            quota["contract"]["contract_cu"],
-            proj.get("projected_annual", 0),
-        )
-        if chart_q:
-            inline_images.append(("chart_quota", chart_q))
-            chart_cids["chart_quota"] = True
-
-    # ── 6. Build HTML ────────────────────────────────────────────────────────
-    html = _build_report_html(
+    return _build_report_html(
         from_date, to_date,
         svc_rows, model_totals, daily_series,
-        quota, hana_summary, chart_cids,
+        quota, hana_summary,
     )
 
-    return html, inline_images
 
-
-# ── LangChain Tool (LLM-callable) ─────────────────────────────────────────────
+# ============================================================================
+# LangChain Tools
+# ============================================================================
 
 @tool
-async def send_summary_email(
-    from_date: str,
-    to_date: str,
+def set_email_config(
+    smtp_host: Optional[str] = None,
+    smtp_port: Optional[int] = None,
+    smtp_user: Optional[str] = None,
+    smtp_password: Optional[str] = None,
+    email_from: Optional[str] = None,
+    email_to: Optional[str] = None,
 ) -> str:
     """
-    Generate a BTP usage summary report for a given date range and send it by email.
+    Update SMTP email configuration at runtime without restarting the agent.
+    All parameters are optional -- only provided values are updated.
 
-    Fetches AI Core CU usage, quota status, HANA metrics, and all BTP services
-    data for the specified period, generates an HTML report with charts, and emails
-    it to the configured recipients (EMAIL_TO env var).
+    Args:
+        smtp_host:     SMTP server hostname
+        smtp_port:     SMTP port (25, 465, or 587)
+        smtp_user:     SMTP login username
+        smtp_password: SMTP password or API key
+        email_from:    Sender address
+        email_to:      Recipient(s), comma-separated
+    Returns:
+        Summary of active configuration.
+    """
+    if smtp_host     is not None: _runtime_email_config["SMTP_HOST"]     = smtp_host
+    if smtp_port     is not None: _runtime_email_config["SMTP_PORT"]     = str(smtp_port)
+    if smtp_user     is not None: _runtime_email_config["SMTP_USER"]     = smtp_user
+    if smtp_password is not None: _runtime_email_config["SMTP_PASSWORD"] = smtp_password
+    if email_from    is not None: _runtime_email_config["EMAIL_FROM"]    = email_from
+    if email_to      is not None: _runtime_email_config["EMAIL_TO"]      = email_to
+
+    current = {
+        "SMTP_HOST":     _get_cfg("SMTP_HOST", "auth.mail.net.sap"),
+        "SMTP_PORT":     _get_cfg("SMTP_PORT", "587"),
+        "SMTP_USER":     _get_cfg("SMTP_USER", ""),
+        "SMTP_PASSWORD": "***" if _get_cfg("SMTP_PASSWORD") else "<not set>",
+        "EMAIL_FROM":    _get_cfg("EMAIL_FROM", ""),
+        "EMAIL_TO":      _get_cfg("EMAIL_TO", ""),
+    }
+    return (
+        f"Email config updated. Runtime overrides: {list(_runtime_email_config.keys()) or 'none'}\n\n"
+        "Active configuration:\n"
+        + "\n".join(f"  {k} = {v}" for k, v in current.items())
+        + "\n\nCall send_test_email() to verify."
+    )
+
+
+@tool
+async def send_test_email() -> str:
+    """
+    Send a plain-text test email to verify SMTP configuration.
+    Use this after set_email_config() to confirm credentials work.
+    Returns: confirmation or a detailed error message.
+    """
+    recipients = _get_recipients()
+    if not recipients:
+        return "EMAIL_TO is not configured. Call set_email_config(email_to='you@example.com') first."
+
+    smtp_host = _get_cfg("SMTP_HOST", "auth.mail.net.sap")
+    smtp_port = int(_get_cfg("SMTP_PORT", "587"))
+    smtp_user = _get_cfg("SMTP_USER", "")
+    smtp_pass = _get_cfg("SMTP_PASSWORD", "")
+    from_addr = _get_cfg("EMAIL_FROM", "noreply+btp_usage_hackathon@sap.corp")
+
+    import ssl as _ssl
+    from email.utils import formatdate
+
+    ctx = _ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode    = _ssl.CERT_NONE
+
+    body = (
+        f"Hello,\n\nThis is a test email from your BTP Usage Agent.\n"
+        f"SMTP={smtp_host}:{smtp_port}  From={from_addr}  To={', '.join(recipients)}\n\n"
+        f"-- BTP Usage Agent"
+    )
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["Subject"] = "BTP Usage Agent -- Email Test"
+    msg["From"]    = from_addr
+    msg["To"]      = ", ".join(recipients)
+    msg["Date"]    = formatdate(localtime=False)
+    raw = msg.as_bytes()
+
+    try:
+        if smtp_port == 465:
+            with smtplib.SMTP_SSL(smtp_host, smtp_port, context=ctx, timeout=15) as s:
+                if smtp_user and smtp_pass:
+                    s.login(smtp_user, smtp_pass)
+                s.sendmail(from_addr, recipients, raw)
+        else:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as s:
+                s.ehlo()
+                s.starttls(context=ctx)
+                s.ehlo()
+                if smtp_user and smtp_pass:
+                    s.login(smtp_user, smtp_pass)
+                s.sendmail(from_addr, recipients, raw)
+        return f"Test email sent to: {', '.join(recipients)}"
+    except Exception as e:
+        return f"FAILED: {type(e).__name__}: {e}"
+
+
+@tool
+def test_smtp_relay() -> str:
+    """
+    Probe candidate SMTP relay hosts via TCP connect to find which one is
+    reachable from this container. Use when email delivery fails with network errors.
+    Returns: table of SUCCESS/FAIL results with recommendation.
+    """
+    import socket
+    candidates = [
+        ("auth.mail.net.sap", 587), ("auth.mail.net.sap", 465),
+        ("smtprelay.sap.corp", 25), ("smtprelay.sap.corp", 587),
+        ("mailout.sap.corp",   25), ("relay.sap.com",     587),
+        ("smtp.sendgrid.net",  587),
+    ]
+    results   = ["=== SMTP Relay Probe ===", ""]
+    reachable = []
+    for host, port in candidates:
+        try:
+            s = socket.create_connection((host, port), timeout=6)
+            banner = b""
+            s.settimeout(3)
+            try:
+                banner = s.recv(256).rstrip()
+            except Exception:
+                pass
+            s.close()
+            results.append(f"  REACHABLE  {host}:{port}  -- {banner[:80].decode('utf-8','replace')}")
+            reachable.append((host, port))
+        except socket.gaierror as e:
+            results.append(f"  DNS FAIL   {host}:{port}  -- {e}")
+        except Exception as e:
+            results.append(f"  FAILED     {host}:{port}  -- {type(e).__name__}: {e}")
+    results.append("")
+    if reachable:
+        results.append(f"RECOMMENDATION: use {reachable[0][0]}:{reachable[0][1]}")
+    else:
+        results.append("NONE reachable -- contact SAP IT for outbound SMTP relay.")
+    return "\n".join(results)
+
+
+@tool
+def debug_email_config() -> str:
+    """
+    Diagnostic: show the SMTP configuration seen by the running container and
+    attempt a TCP connection to the SMTP host. Use this to troubleshoot email
+    delivery problems.
+    Returns: config summary and TCP connectivity result.
+    """
+    import socket
+    smtp_host = _get_cfg("SMTP_HOST", "<not set>")
+    smtp_port_raw = _get_cfg("SMTP_PORT", "587")
+    smtp_user = _get_cfg("SMTP_USER", "<not set>")
+    smtp_pass = _get_cfg("SMTP_PASSWORD", "")
+    from_addr = _get_cfg("EMAIL_FROM", "<not set>")
+    to_addr   = _get_cfg("EMAIL_TO",   "<not set>")
+
+    lines = [
+        "=== Runtime Email Config ===",
+        f"  SMTP_HOST     : {smtp_host}",
+        f"  SMTP_PORT     : {smtp_port_raw}",
+        f"  SMTP_USER     : {smtp_user}",
+        f"  SMTP_PASSWORD : {'***' if smtp_pass else '<not set>'}",
+        f"  EMAIL_FROM    : {from_addr}",
+        f"  EMAIL_TO      : {to_addr}",
+        f"  Chart engine  : pure-Python SVG (no matplotlib/Pillow required)",
+        "",
+    ]
+    port = int(smtp_port_raw) if smtp_port_raw.isdigit() else 587
+    try:
+        sock = socket.create_connection((smtp_host, port), timeout=8)
+        sock.close()
+        lines.append(f"TCP {smtp_host}:{port} -> REACHABLE")
+    except Exception as exc:
+        lines.append(f"TCP {smtp_host}:{port} -> FAILED: {type(exc).__name__}: {exc}")
+    return "\n".join(lines)
+
+
+@tool
+async def send_summary_email(from_date: str, to_date: str) -> str:
+    """
+    Generate a BTP usage report for the given date range and send it by email.
+
+    The HTML report includes inline SVG charts (no images, no external dependencies):
+      - Bar chart: AI Core daily CU usage with average line and spike highlights
+      - Horizontal bars: per-model CU breakdown
+      - Progress bar: annual quota used vs projected vs contract limit
+      - Tables: HANA Cloud metrics and all BTP services usage
 
     Args:
         from_date: Start date in YYYY-MM-DD format (e.g. "2026-06-01")
         to_date:   End date in YYYY-MM-DD format (e.g. "2026-06-17")
-
     Returns:
-        Confirmation message with recipient list, or error description.
+        Confirmation with recipient list, or error description.
     """
     from_date = _validate_date(from_date, "from_date")
     to_date   = _validate_date(to_date,   "to_date")
@@ -593,56 +841,41 @@ async def send_summary_email(
 
     recipients = _get_recipients()
     if not recipients:
-        return "Email not configured — set EMAIL_TO in your .env file."
+        return "Email not configured -- set EMAIL_TO in .env or call set_email_config()."
 
     try:
-        html, inline_images = await _fetch_and_build_report(from_date, to_date)
-        subject = f"BTP Usage Report: {from_date} to {to_date}"
-        _send_email(subject, html, inline_images)
+        html = await _fetch_and_build_report(from_date, to_date)
+        _send_email(f"BTP Usage Report: {from_date} to {to_date}", html)
         return f"Report sent to {', '.join(recipients)} covering {from_date} to {to_date}."
     except Exception as exc:
-        logger.exception("send_summary_email failed")
-        return f"Failed to send report: {exc}"
+        import traceback
+        logger.error("send_summary_email failed:\n%s", traceback.format_exc())
+        return f"Failed to send report: {type(exc).__name__}: {exc}"
 
 
-# ── Scheduler-facing functions (NOT @tool) ────────────────────────────────────
+# ============================================================================
+# Scheduler-facing functions (NOT @tool -- called by APScheduler)
+# ============================================================================
 
 async def send_daily_report_email() -> None:
-    """Called by APScheduler every morning. Sends yesterday's usage report."""
+    """Called by APScheduler every morning to send yesterday's report."""
     yesterday = (datetime.now(tz=timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
     try:
-        html, inline_images = await _fetch_and_build_report(yesterday, yesterday)
-        subject = f"BTP Daily Report — {yesterday}"
-        _send_email(subject, html, inline_images)
-        logger.info("Daily report email sent for %s", yesterday)
+        html = await _fetch_and_build_report(yesterday, yesterday)
+        _send_email(f"BTP Daily Report -- {yesterday}", html)
+        logger.info("Daily report sent for %s", yesterday)
     except Exception as exc:
-        logger.exception("Daily report email failed: %s", exc)
+        logger.exception("Daily report failed: %s", exc)
 
 
 async def send_anomaly_alert_email(anomaly_result: dict) -> None:
     """Called by APScheduler when detect_aicore_cu_anomaly finds anomalies."""
     total_anomalies = anomaly_result.get("total_daily_anomalies", [])
     per_model       = anomaly_result.get("per_model_anomalies", {})
-
-    anomaly_dates = {a["date"] for a in total_anomalies}
-    for anoms in per_model.values():
-        for a in anoms:
-            anomaly_dates.add(a["date"])
-
-    daily_series = anomaly_result.get("data_summary", {}).get("daily_series", [])
-    chart_bytes  = _chart_anomaly_trend(daily_series, anomaly_dates)
-
-    html = _build_anomaly_html(anomaly_result, chart_bytes)
-
-    total_count = len(total_anomalies) + sum(len(v) for v in per_model.values())
-    subject = f"⚠️ BTP AI Core Anomaly Alert — {total_count} anomaly(-ies) detected"
-
-    inline_images = []
-    if chart_bytes:
-        inline_images.append(("chart_anomaly", chart_bytes))
-
+    total_count     = len(total_anomalies) + sum(len(v) for v in per_model.values())
+    html = _build_anomaly_html(anomaly_result)
     try:
-        _send_email(subject, html, inline_images)
-        logger.info("Anomaly alert email sent: %d anomalies", total_count)
+        _send_email(f"BTP AI Core Anomaly Alert -- {total_count} anomaly(-ies) detected", html)
+        logger.info("Anomaly alert sent: %d anomalies", total_count)
     except Exception as exc:
-        logger.exception("Anomaly alert email failed: %s", exc)
+        logger.exception("Anomaly alert failed: %s", exc)

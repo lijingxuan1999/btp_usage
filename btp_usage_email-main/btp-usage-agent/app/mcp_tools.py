@@ -40,12 +40,6 @@ from hana_tool import (
 from email_tool import (
     # ── On-demand summary email ───────────────────────────────────────────────
     send_summary_email,
-    # ── Runtime config + test ────────────────────────────────────────────────
-    set_email_config,
-    send_test_email,
-    # ── SMTP diagnostics ─────────────────────────────────────────────────────
-    debug_email_config,
-    test_smtp_relay,
 )
 
 logger = logging.getLogger(__name__)
@@ -77,12 +71,6 @@ _HANA_TOOLS = [
 _EMAIL_TOOLS = [
     # ── On-demand report email (user-triggered via chat) ──────────────────────
     send_summary_email,
-    # ── Runtime credential update + quick test ────────────────────────────────
-    set_email_config,
-    send_test_email,
-    # ── SMTP diagnostics ─────────────────────────────────────────────────────
-    debug_email_config,
-    test_smtp_relay,
 ]
 
 
